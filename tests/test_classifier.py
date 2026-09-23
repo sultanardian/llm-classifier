@@ -1,3 +1,4 @@
+from types import SimpleNamespace
 from unittest import mock
 
 import pytest
@@ -8,6 +9,7 @@ from llm_classifier.scoring import sigmoid
 # Token ID fiktif yang dipakai bersama seluruh fake.
 YES_ID = 123
 NO_ID = 456
+SINGLE_TOKEN_LABELS = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
 
 
 class _FakeLogprob:
@@ -30,6 +32,18 @@ def _two_choice(yes_val, no_val):
     )
 
 
+def _one_label(scores, selected):
+    return mock.Mock(
+        choices=[
+            SimpleNamespace(
+                index=0,
+                text=selected,
+                logprobs=SimpleNamespace(top_logprobs=[scores]),
+            )
+        ]
+    )
+
+
 def _fake_post(*args):
     payload = args[-1]
     if "messages" in payload:
@@ -37,6 +51,13 @@ def _fake_post(*args):
     label = payload.get("prompt")
     if label == "No":
         return {"tokens": [NO_ID], "token_strs": ["No"]}
+    if isinstance(label, str) and len(label) == 1 and (
+        label.isdigit() or label.isalpha()
+    ):
+        return {
+            "tokens": [100 + SINGLE_TOKEN_LABELS.index(label)],
+            "token_strs": [label],
+        }
     return {"tokens": [YES_ID], "token_strs": ["Yes"]}
 
 
@@ -88,6 +109,7 @@ def test_mayor_settings_are_required():
         )
     assert classifier.image_detail == "low"
     assert classifier.timeout == 120
+    assert classifier.sampling_temperature == 0.0
 
 
 def test_from_openai_signature():
@@ -205,16 +227,10 @@ def test_noul_with_criteria_appended_to_question():
 
 def test_choice_text_only():
     client = _make_client()
-    # skor per kandidat berbeda: a=6, b=2, c=0 -> a terpilih
-    candidate_scores = [6.0, 2.0, 0.0]
-    call = {"i": 0}
-
-    def create(model, prompt, **kwargs):
-        s = candidate_scores[call["i"]]
-        call["i"] += 1
-        return _two_choice(s, 0.0)
-
-    client.completions.create.side_effect = create
+    client.completions.create.return_value = _one_label(
+        {"0": 6.0, "1": 2.0, "2": 0.0},
+        "0",
+    )
     with mock.patch.object(PromptLogprobClassifier, "_post_json") as mock_post:
         mock_post.side_effect = _fake_post
         classifier = _make_classifier(client)
@@ -230,15 +246,10 @@ def test_choice_text_only():
 
 def test_score_text_only():
     client = _make_client()
-    candidate_scores = [0.0, 3.0, 9.0]
-    call = {"i": 0}
-
-    def create(model, prompt, **kwargs):
-        s = candidate_scores[call["i"]]
-        call["i"] += 1
-        return _two_choice(s, 0.0)
-
-    client.completions.create.side_effect = create
+    client.completions.create.return_value = _one_label(
+        {"0": 0.0, "1": 3.0, "2": 9.0},
+        "2",
+    )
     with mock.patch.object(PromptLogprobClassifier, "_post_json") as mock_post:
         mock_post.side_effect = _fake_post
         classifier = _make_classifier(client)
@@ -249,6 +260,90 @@ def test_score_text_only():
     # kandidat index 2 paling tinggi -> expected_score mendekati 2
     assert result["score"] > 1.5
     assert result["legend"] == {"0": "low: x", "1": "mid: y", "2": "high: z"}
+
+
+def test_direct_label_missing_scores_become_zero_and_request_is_single():
+    client = _make_client()
+    client.completions.create.return_value = _one_label(
+        {"0": -0.1, "1": -1.1},
+        "0",
+    )
+    with mock.patch.object(PromptLogprobClassifier, "_post_json") as mock_post:
+        mock_post.side_effect = _fake_post
+        classifier = _make_classifier(client)
+        result = classifier.choice(
+            "ctx",
+            "q?",
+            {"a": "def-a", "b": "def-b", "c": "def-c"},
+        )
+
+    assert result["choice"] == "a"
+    assert result["probabilities"]["c"] == 0.0
+    assert sum(result["probabilities"].values()) == pytest.approx(1.0)
+    assert client.completions.create.call_count == 1
+    assert client.completions.create.call_args.kwargs["temperature"] == 0.0
+    assert client.completions.create.call_args.kwargs["logprobs"] == 20
+
+
+def test_direct_label_above_top_twenty_is_used_if_returned():
+    client = _make_client()
+    client.completions.create.return_value = _one_label(
+        {"0": -4.0, "L": -0.1},
+        "L",
+    )
+    criteria = {f"key-{index}": f"definition-{index}" for index in range(22)}
+    with mock.patch.object(PromptLogprobClassifier, "_post_json") as mock_post:
+        mock_post.side_effect = _fake_post
+        classifier = _make_classifier(client)
+        result = classifier.choice("ctx", "q?", criteria)
+
+    assert result["choice"] == "key-21"
+    assert result["probabilities"]["key-21"] > 0.5
+    assert client.completions.create.call_count == 1
+
+
+def test_direct_label_multimodal_uses_one_chat_request(tmp_path):
+    import base64
+
+    png_bytes = base64.b64decode(
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJ"
+        "AAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg=="
+    )
+    image_file = tmp_path / "tiny.png"
+    image_file.write_bytes(png_bytes)
+
+    top_logprobs = [
+        SimpleNamespace(token="0", logprob=-0.1),
+        SimpleNamespace(token="1", logprob=-2.0),
+    ]
+    client = _make_client()
+    client.chat.completions.create.return_value = mock.Mock(
+        choices=[
+            SimpleNamespace(
+                index=0,
+                message=SimpleNamespace(content="0"),
+                logprobs=SimpleNamespace(
+                    content=[SimpleNamespace(top_logprobs=top_logprobs)]
+                ),
+            )
+        ]
+    )
+    with mock.patch.object(PromptLogprobClassifier, "_post_json") as mock_post:
+        mock_post.side_effect = _fake_post
+        classifier = _make_classifier(client)
+        result = classifier.choice(
+            "ctx",
+            "q?",
+            {"a": "def-a", "b": "def-b"},
+            image_paths=[str(image_file)],
+        )
+
+    assert result["choice"] == "a"
+    assert client.chat.completions.create.call_count == 1
+    kwargs = client.chat.completions.create.call_args.kwargs
+    assert kwargs["temperature"] == 0.0
+    assert kwargs["top_logprobs"] == 20
+    assert kwargs["messages"][0]["content"][1]["type"] == "image_url"
 
 
 def test_multimodal_yes_no_score_uses_chat_completions(tmp_path):

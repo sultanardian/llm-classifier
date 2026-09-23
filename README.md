@@ -37,8 +37,9 @@ src/llm_classifier/
 
 ## Konfigurasi
 
-Semua konfigurasi dimiliki oleh aplikasi, bukan modul. Nilai yang
-memengaruhi hasil scoring **wajib** diisi saat membangun classifier:
+Semua konfigurasi dimiliki oleh aplikasi, bukan modul. Nilai mayor yang
+memengaruhi hasil scoring wajib diisi saat membangun classifier; nilai minor
+memiliki default:
 
 ```python
 from llm_classifier import PromptLogprobClassifier, ask
@@ -47,10 +48,11 @@ classifier = PromptLogprobClassifier.from_openai(
     base_url="http://192.168.16.41:11000/v1",
     model="Qwen3.8-27B",
     api_key="sk-EMPTY",            # vLLM biasanya menerima key apa pun
-    decision_temperature=3.0,      # temperature kalibrasi (bukan sampling)
+    decision_temperature=3.0,      # temperature kalibrasi
     seed=42,
     prompt_logprobs=20,
-    # minor (punya default): image_detail="low", timeout=120
+    # minor (punya default): sampling_temperature=0.0,
+    # image_detail="low", timeout=120
 )
 ```
 
@@ -110,6 +112,15 @@ result = ask(
 )
 ```
 
+Untuk `choice` dan `score`, classifier meminta model menghasilkan satu token
+kode opsi dalam satu generation. Kode internal memakai `0` sampai `9`, lalu
+`A` sampai `Z`, lalu `a` sampai `z` (maksimal 62 opsi). `noul` tetap memakai
+scoring `Yes`/`No`.
+
+`prompt_logprobs` juga dipakai sebagai jumlah `top_logprobs` untuk direct
+label. Label yang tidak dikembalikan vLLM diberi probabilitas `0`; label yang
+tersedia dinormalisasi ulang dengan `decision_temperature`.
+
 ## Kalibrasi
 
 Score logprob biasanya belum terkalibrasi. Gunakan data validasi yang tidak
@@ -127,14 +138,14 @@ classifier.decision_temperature = calibrated
 
 ## Catatan / keterbatasan
 
-- Score berasal dari log-odds token `Yes`/`No` model; token `Yes` dan `No`
-  harus masing-masing satu token pada tokenizer server.
-- Scoring memakai `prompt_logprobs`, bukan `top_logprobs`; label aktual tetap
-  tersedia walaupun rank-nya di luar top-k.
+- `noul` berasal dari log-odds token `Yes`/`No`; token tersebut harus
+  masing-masing satu token pada tokenizer server.
+- `choice` dan `score` memakai satu token label dengan `logprobs`/`top_logprobs`.
+  Label yang hilang dari top-k diperlakukan sebagai probabilitas nol.
 - Jalur text-only memakai `/tokenize` + `/v1/completions`; jalur image memakai
-  `chat.completions` dengan `prompt_logprobs` dan `return_token_ids`.
-- `DECISION_TEMPERATURE` adalah temperature kalibrasi, bukan sampling
-  temperature vLLM (sampling tetap `1.0`).
+  `chat.completions` dengan satu generation token.
+- `decision_temperature` adalah temperature kalibrasi. `sampling_temperature`
+  mengatur generation vLLM dan default-nya `0.0` agar top-1 deterministik.
 - Cache aplikasi (`_score_cache`, `_image_cache`) menjamin request identik
   mengembalikan hasil identik pada proses yang sama; `clear_cache()`
   mengosongkan keduanya.
