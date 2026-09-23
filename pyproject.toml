@@ -1,0 +1,24 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "llm-classifier"
+version = "0.1.0"
+description = "Yes/No prompt-logprob classifier for models served by vLLM"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "openai>=1.40",
+]
+
+[project.optional-dependencies]
+test = [
+    "pytest>=8",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/llm_classifier"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
